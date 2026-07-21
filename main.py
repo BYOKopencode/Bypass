@@ -1,23 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
 
 from deepseek import DeepSeekClient
 
-# Optional: protect the API with a key
 API_KEY = os.environ.get("API_KEY", "")
 
 app = FastAPI(title="DeepSeek OpenAI-compatible API")
 
-# Single shared client — one session per process
 _client: Optional[DeepSeekClient] = None
 _chat_session_id: Optional[str] = None
 _parent_message_id: Optional[str] = None
@@ -33,28 +31,38 @@ def get_client() -> DeepSeekClient:
 
 def reset_session() -> None:
     global _chat_session_id, _parent_message_id
-    client = get_client()
-    _chat_session_id, _parent_message_id = client.create_session()
+    _chat_session_id, _parent_message_id = get_client().create_session()
 
 
-# ── Models ────────────────────────────────────────────────────────────────────
+def _flatten_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                t = block.get("type", "")
+                if t == "text":
+                    parts.append(block.get("text", ""))
+                elif t == "tool_result":
+                    # flatten nested content inside tool results
+                    parts.append(_flatten_content(block.get("content", "")))
+                elif t not in ("image", "image_url"):
+                    # unknown block — try to grab any text-ish value
+                    for key in ("text", "content", "value"):
+                        v = block.get(key)
+                        if isinstance(v, str) and v:
+                            parts.append(v)
+                            break
+        return "\n".join(p for p in parts if p)
+    if content is None:
+        return ""
+    return str(content)
 
-class Message(BaseModel):
-    role: str
-    content: str
 
-
-class ChatCompletionRequest(BaseModel):
-    model: str = "deepseek-chat"
-    messages: list[Message]
-    stream: bool = False
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-
-
-# ── Auth helper ───────────────────────────────────────────────────────────────
-
-def check_auth(request: Request) -> None:
+def _check_auth(request: Request) -> None:
     if not API_KEY:
         return
     auth = request.headers.get("Authorization", "")
@@ -66,12 +74,12 @@ def check_auth(request: Request) -> None:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "DeepSeek OpenAI-compatible API"}
+    return {"status": "ok"}
 
 
 @app.get("/v1/models")
 def list_models(request: Request):
-    check_auth(request)
+    _check_auth(request)
     return {
         "object": "list",
         "data": [
@@ -82,23 +90,41 @@ def list_models(request: Request):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, body: ChatCompletionRequest):
+async def chat_completions(request: Request):
     global _chat_session_id, _parent_message_id
 
-    check_auth(request)
+    _check_auth(request)
 
-    thinking_enabled = "reason" in body.model.lower()
-    messages = [m.model_dump() for m in body.messages]
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # Log truncated body to Railway logs for debugging
+    logging.warning("BODY: %s", json.dumps(body)[:1000])
+
+    model = body.get("model", "deepseek-chat") or "deepseek-chat"
+    stream = bool(body.get("stream", False))
+    thinking_enabled = "reason" in str(model).lower()
+
+    raw_messages = body.get("messages") or []
+    messages = [
+        {"role": str(m.get("role", "user")), "content": _flatten_content(m.get("content", ""))}
+        for m in raw_messages
+        if isinstance(m, dict)
+    ]
+
+    if not messages:
+        raise HTTPException(status_code=400, detail="No messages provided")
 
     client = get_client()
 
-    if body.stream:
+    if stream:
         return StreamingResponse(
             _stream_response(client, messages, thinking_enabled),
             media_type="text/event-stream",
         )
-    else:
-        return await _non_stream_response(client, messages, thinking_enabled)
+    return await _non_stream_response(client, messages, thinking_enabled)
 
 
 async def _stream_response(
@@ -108,11 +134,10 @@ async def _stream_response(
 ) -> AsyncGenerator[str, None]:
     global _chat_session_id, _parent_message_id
 
-    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-    created = int(time.time())
+    cid = f"chatcmpl-{uuid.uuid4().hex}"
+    ts = int(time.time())
 
-    # Opening chunk
-    yield _sse(completion_id, created, delta={"role": "assistant", "content": ""})
+    yield _sse(cid, ts, delta={"role": "assistant", "content": ""})
 
     try:
         for delta, new_parent_id in client.stream_message(
@@ -124,20 +149,18 @@ async def _stream_response(
             if new_parent_id is not None:
                 _parent_message_id = new_parent_id
             if delta:
-                yield _sse(completion_id, created, delta={"content": delta})
+                yield _sse(cid, ts, delta={"content": delta})
 
     except RuntimeError as exc:
-        err_msg = str(exc)
-        # Try session refresh on auth errors
-        if any(code in err_msg for code in ("401", "403", "40001", "40004", "session")):
+        msg = str(exc)
+        if any(c in msg for c in ("401", "403", "40001", "40004", "session")):
             try:
                 reset_session()
             except Exception:
                 pass
-        yield _sse(completion_id, created, delta={"content": f"\n\n[Error: {err_msg}]"})
+        yield _sse(cid, ts, delta={"content": f"\n\n[Error: {msg}]"})
 
-    # Final chunk
-    yield _sse(completion_id, created, finish_reason="stop")
+    yield _sse(cid, ts, finish_reason="stop")
     yield "data: [DONE]\n\n"
 
 
@@ -161,39 +184,24 @@ async def _non_stream_response(
             if delta:
                 full_text += delta
     except RuntimeError as exc:
-        err_msg = str(exc)
-        if any(code in err_msg for code in ("401", "403", "40001", "40004", "session")):
+        msg = str(exc)
+        if any(c in msg for c in ("401", "403", "40001", "40004", "session")):
             try:
                 reset_session()
             except Exception:
                 pass
-        raise HTTPException(status_code=502, detail=err_msg)
+        raise HTTPException(status_code=502, detail=msg)
 
-    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    cid = f"chatcmpl-{uuid.uuid4().hex}"
     return JSONResponse({
-        "id": completion_id,
+        "id": cid,
         "object": "chat.completion",
         "created": int(time.time()),
         "model": "deepseek-chat",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": full_text},
-            "finish_reason": "stop",
-        }],
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": full_text}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     })
 
 
-def _sse(completion_id: str, created: int, delta: dict = {}, finish_reason: Optional[str] = None) -> str:
-    chunk = {
-        "id": completion_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": "deepseek-chat",
-        "choices": [{
-            "index": 0,
-            "delta": delta,
-            "finish_reason": finish_reason,
-        }],
-    }
-    return f"data: {json.dumps(chunk)}\n\n"
+def _sse(cid: str, ts: int, delta: dict = {}, finish_reason: Optional[str] = None) -> str:
+    return f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': ts, 'model': 'deepseek-chat', 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish_reason}]})}\n\n"
